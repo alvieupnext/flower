@@ -311,6 +311,7 @@ def test_build_fab_from_files_without_fab_include_uses_all_then_builtin() -> Non
             "README.md": b"# docs\n",
             "data.mock": b"not included",
             "config.json": b'{"a": 1}',
+            "script.m": b"disp('hello')",
         },
     )
     entries = _build_entries(files)
@@ -318,6 +319,7 @@ def test_build_fab_from_files_without_fab_include_uses_all_then_builtin() -> Non
     assert "client.py" in entries
     assert "README.md" in entries
     assert "data.mock" not in entries
+    assert "script.m" in entries
     assert "config.json" in entries
 
 
