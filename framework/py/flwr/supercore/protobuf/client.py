@@ -16,14 +16,18 @@
 
 from __future__ import annotations
 
+import ssl
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Protocol, Self, TypeVar
+from typing import TYPE_CHECKING, Protocol, Self, TypeVar
 
-import requests
+import httpx
 from google.protobuf.message import DecodeError, Message
 
 from .constants import PROTOBUF_MEDIA_TYPE
+
+if TYPE_CHECKING:
+    from flwr.supercore.retry import RetryInvoker
 
 ResponseT = TypeVar("ResponseT", bound=Message)
 
@@ -34,10 +38,10 @@ class ProtobufRequestContext:
 
     rpc_method: str
     message: Message
-    request: requests.PreparedRequest
+    request: httpx.Request
 
 
-ProtobufCall = Callable[[ProtobufRequestContext], requests.Response]
+ProtobufCall = Callable[[ProtobufRequestContext], httpx.Response]
 
 
 class ProtobufClientInterceptor(Protocol):
@@ -47,7 +51,7 @@ class ProtobufClientInterceptor(Protocol):
         self,
         context: ProtobufRequestContext,
         call_next: ProtobufCall,
-    ) -> requests.Response:
+    ) -> httpx.Response:
         """Process a request around the next interceptor or HTTP transport."""
 
 
@@ -57,7 +61,7 @@ def _wrap_interceptor(
 ) -> ProtobufCall:
     """Wrap one interceptor around the next call in the chain."""
 
-    def call(context: ProtobufRequestContext) -> requests.Response:
+    def call(context: ProtobufRequestContext) -> httpx.Response:
         return interceptor.intercept(context, call_next)
 
     return call
@@ -66,19 +70,56 @@ def _wrap_interceptor(
 class ProtobufClient:
     """Client providing shared protobuf-over-HTTP request handling."""
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         base_url: str,
         *,
         interceptors: Sequence[ProtobufClientInterceptor] = (),
-        verify: bool | str = True,
+        verify: ssl.SSLContext | bool | str = True,
         timeout: float = 30.0,
+        retry_invoker: RetryInvoker | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._interceptors = tuple(interceptors)
-        self._verify = verify
-        self._timeout = timeout
-        self._session = requests.Session()
+        self._retry_invoker = retry_invoker
+        self._client = httpx.Client(
+            verify=verify,
+            timeout=timeout,
+            follow_redirects=True,
+        )
+
+    @classmethod
+    def from_server_address(  # pylint: disable=too-many-arguments
+        cls,
+        server_address: str,
+        insecure: bool,
+        root_certificates: bytes | str | None,
+        interceptors: Sequence[ProtobufClientInterceptor],
+        *,
+        retry_invoker: RetryInvoker | None = None,
+    ) -> Self:
+        """Create a protobuf-over-HTTP client from a server address."""
+        if insecure and root_certificates is not None:
+            raise ValueError(
+                "Invalid configuration: 'root_certificates' should not be provided "
+                "when 'insecure' is set to True."
+            )
+
+        scheme = "http" if insecure else "https"
+        verify: ssl.SSLContext | str | bool = not insecure
+        if not insecure and root_certificates is not None:
+            if isinstance(root_certificates, str):
+                verify = root_certificates
+            else:
+                verify = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                verify.load_verify_locations(cadata=root_certificates.decode("ascii"))
+
+        return cls(
+            f"{scheme}://{server_address}",
+            interceptors=interceptors,
+            verify=verify,
+            retry_invoker=retry_invoker,
+        )
 
     def _unary_unary(
         self,
@@ -90,22 +131,32 @@ class ProtobufClient:
     ) -> ResponseT:
         """Send a unary request and parse its unary protobuf response."""
         path = path if path.startswith("/") else f"/{path}"
-        http_request = requests.Request(
-            method="POST",
-            url=f"{self._base_url}{path}",
-            data=request.SerializeToString(deterministic=True),
-            headers={
-                "content-type": PROTOBUF_MEDIA_TYPE,
-                "accept": PROTOBUF_MEDIA_TYPE,
-            },
+        content = request.SerializeToString(deterministic=True)
+
+        def send() -> httpx.Response:
+            http_request = self._client.build_request(
+                method="POST",
+                url=f"{self._base_url}{path}",
+                content=content,
+                headers={
+                    "content-type": PROTOBUF_MEDIA_TYPE,
+                    "accept": PROTOBUF_MEDIA_TYPE,
+                },
+            )
+            context = ProtobufRequestContext(
+                rpc_method=rpc_method,
+                message=request,
+                request=http_request,
+            )
+            http_response = self._send(context)
+            http_response.raise_for_status()
+            return http_response
+
+        response = (
+            self._retry_invoker.invoke(send)
+            if self._retry_invoker is not None
+            else send()
         )
-        context = ProtobufRequestContext(
-            rpc_method=rpc_method,
-            message=request,
-            request=self._session.prepare_request(http_request),
-        )
-        response = self._send(context)
-        response.raise_for_status()
 
         result = response_type()
         try:
@@ -114,15 +165,11 @@ class ProtobufClient:
             raise ValueError("Invalid protobuf response payload") from exc
         return result
 
-    def _send(self, context: ProtobufRequestContext) -> requests.Response:
+    def _send(self, context: ProtobufRequestContext) -> httpx.Response:
         """Send a request through the configured interceptor chain."""
 
-        def send(current_context: ProtobufRequestContext) -> requests.Response:
-            return self._session.send(
-                current_context.request,
-                verify=self._verify,
-                timeout=self._timeout,
-            )
+        def send(current_context: ProtobufRequestContext) -> httpx.Response:
+            return self._client.send(current_context.request)
 
         call_next: ProtobufCall = send
         for interceptor in reversed(self._interceptors):
@@ -131,8 +178,8 @@ class ProtobufClient:
         return call_next(context)
 
     def close(self) -> None:
-        """Close the underlying HTTP session."""
-        self._session.close()
+        """Close the underlying HTTP client."""
+        self._client.close()
 
     def __enter__(self) -> Self:
         """Return this client from a context manager."""

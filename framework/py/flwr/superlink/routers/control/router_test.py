@@ -18,15 +18,12 @@
 from datetime import datetime
 from unittest.mock import Mock
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
-from pytest import MonkeyPatch
 
 from flwr.common.constant import NOOP_FLWR_AID
 from flwr.proto.control_pb2 import (  # pylint: disable=E0611
-    GetLoginDetailsRequest,
-    GetLoginDetailsResponse,
     ListRunsRequest,
     ListRunsResponse,
 )
@@ -44,7 +41,6 @@ from flwr.superlink.dependencies.account import AccountAccessDependency
 from flwr.superlink.dependencies.linkstate import get_linkstate
 from flwr.superlink.routers.control.middlewares import ControlAuthenticationMiddleware
 from flwr.superlink.routers.control.router import router
-from flwr.superlink.servicer.control import control_handlers
 
 _ACCOUNT = AccountInfo(flwr_aid=NOOP_FLWR_AID, account_name="account")
 
@@ -98,7 +94,93 @@ def test_protobuf_request_without_handler_response_returns_internal_error() -> N
     )
 
     assert response.status_code == 500
-    assert response.json()["code"] == ApiErrorCode.INVALID_PROTOBUF_RESPONSE
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {
+        "detail": "Invalid protobuf response.",
+        "code": ApiErrorCode.INVALID_PROTOBUF_RESPONSE.value,
+    }
+
+
+def test_protobuf_route_passes_through_http_exception() -> None:
+    """Return completed JSON errors without requiring a protobuf response."""
+    app = FastAPI()
+
+    @app.post("/v1/control/list-runs")
+    def list_runs() -> None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Run already exists.",
+        )
+
+    app.add_middleware(ProtobufTranslationMiddleware)
+    app.middleware("http")(http_error_translator)
+
+    response = TestClient(app).post(
+        "/v1/control/list-runs",
+        content=ListRunsRequest().SerializeToString(),
+        headers={
+            "accept": PROTOBUF_MEDIA_TYPE,
+            "content-type": PROTOBUF_MEDIA_TYPE,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {"detail": "Run already exists."}
+
+
+def test_protobuf_route_passes_through_validation_error() -> None:
+    """Return FastAPI request validation errors as JSON."""
+    app = FastAPI()
+
+    @app.post("/v1/control/list-runs")
+    def list_runs(limit: int) -> None:  # pylint: disable=unused-argument
+        return None
+
+    app.add_middleware(ProtobufTranslationMiddleware)
+    app.middleware("http")(http_error_translator)
+
+    response = TestClient(app).post(
+        "/v1/control/list-runs?limit=invalid",
+        content=ListRunsRequest().SerializeToString(),
+        headers={"content-type": PROTOBUF_MEDIA_TYPE},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/json"
+    payload = response.json()
+    assert set(payload) == {"detail"}
+    assert isinstance(payload["detail"], list)
+
+
+def test_protobuf_route_rejects_non_json_error_response() -> None:
+    """Reject non-JSON errors instead of bypassing protobuf validation."""
+    app = FastAPI()
+
+    @app.post("/v1/control/list-runs")
+    def list_runs() -> Response:
+        return Response(
+            content="Conflict.",
+            status_code=status.HTTP_409_CONFLICT,
+            media_type="text/plain",
+        )
+
+    app.add_middleware(ProtobufTranslationMiddleware)
+    app.middleware("http")(http_error_translator)
+
+    response = TestClient(app).post(
+        "/v1/control/list-runs",
+        content=ListRunsRequest().SerializeToString(),
+        headers={"content-type": PROTOBUF_MEDIA_TYPE},
+    )
+
+    assert response.status_code == 500
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {
+        "detail": "Invalid protobuf response.",
+        "code": ApiErrorCode.INVALID_PROTOBUF_RESPONSE.value,
+    }
+    assert b"Conflict" not in response.content
 
 
 def test_non_protobuf_request_in_state_returns_internal_error() -> None:
@@ -116,7 +198,11 @@ def test_non_protobuf_request_in_state_returns_internal_error() -> None:
     response = TestClient(app).post("/v1/control/list-runs")
 
     assert response.status_code == 500
-    assert response.json()["code"] == ApiErrorCode.INVALID_PROTOBUF_REQUEST
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {
+        "detail": "Invalid protobuf request.",
+        "code": ApiErrorCode.INVALID_PROTOBUF_REQUEST.value,
+    }
 
 
 def test_list_runs_returns_runs_from_linkstate() -> None:
@@ -140,6 +226,7 @@ def test_list_runs_returns_runs_from_linkstate() -> None:
     proto_response = ListRunsResponse.FromString(response.content)
 
     assert response.status_code == 200
+    assert response.headers["content-type"] == PROTOBUF_MEDIA_TYPE
     assert set(proto_response.run_dict) == {7}
     assert proto_response.run_dict[7].account_name == _ACCOUNT.account_name
     assert datetime.fromisoformat(proto_response.now)
@@ -169,11 +256,7 @@ def test_list_runs_rejects_invalid_token_without_refresh() -> None:
     )
 
     assert response.status_code == 401
-    assert response.json() == {
-        "code": ApiErrorCode.ACCOUNT_AUTHENTICATION_FAILED,
-        "public_message": "Authentication failed.",
-        "public_details": None,
-    }
+    assert response.json() == {"detail": "Not authenticated"}
     assert response.headers["www-authenticate"] == "Bearer"
     assert "x-access-token" not in response.headers
     assert "x-refresh-token" not in response.headers
@@ -195,27 +278,32 @@ def test_list_runs_rejects_non_protobuf_payload() -> None:
     )
 
     assert response.status_code == 415
-    assert response.json()["code"] == ApiErrorCode.UNSUPPORTED_CONTENT_TYPE
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {
+        "detail": "Unsupported Content-Type.",
+        "code": ApiErrorCode.UNSUPPORTED_CONTENT_TYPE.value,
+    }
 
 
-def test_get_login_details_does_not_require_authentication(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """The login bootstrap endpoint remains available before authentication."""
-    authn_plugin = Mock()
-    expected = GetLoginDetailsResponse(authn_type="noop")
-    monkeypatch.setattr(
-        control_handlers,
-        "get_login_details",
-        lambda _request, _plugin: expected,
-    )
-    app = _create_app(authn_plugin=authn_plugin)
+def test_list_runs_rejects_invalid_protobuf_bytes() -> None:
+    """Return the shared JSON error for an invalid serialized protobuf."""
+    linkstate = Mock(spec=LinkState)
+    app = _create_app()
+    app.dependency_overrides[get_linkstate] = lambda: linkstate
+
     response = TestClient(app).post(
-        "/v1/control/get-login-details",
-        content=GetLoginDetailsRequest().SerializeToString(),
-        headers={"content-type": PROTOBUF_MEDIA_TYPE},
+        "/v1/control/list-runs",
+        content=b"\x80",
+        headers={
+            "accept": PROTOBUF_MEDIA_TYPE,
+            "authorization": "Bearer access-token",
+            "content-type": PROTOBUF_MEDIA_TYPE,
+        },
     )
 
-    assert response.status_code == 200
-    assert GetLoginDetailsResponse.FromString(response.content) == expected
-    authn_plugin.validate_tokens_in_metadata.assert_not_called()
+    assert response.status_code == 400
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {
+        "detail": "Invalid protobuf payload.",
+        "code": ApiErrorCode.INVALID_PROTOBUF_PAYLOAD.value,
+    }

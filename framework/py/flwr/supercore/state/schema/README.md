@@ -44,22 +44,19 @@ erDiagram
     VARCHAR state
   }
 
-  context {
-    BIGINT run_id FK "nullable"
-    BLOB context "nullable"
-  }
-
   fab {
     VARCHAR fab_hash PK
     BLOB content
     VARCHAR verifications
   }
 
-  logs {
-    BIGINT run_id FK "nullable"
-    VARCHAR log "nullable"
-    BIGINT node_id "nullable"
-    FLOAT timestamp "nullable"
+  federation_app {
+    VARCHAR app_id PK
+    VARCHAR federation_id PK
+    TIMESTAMP added_at
+    VARCHAR added_by
+    VARCHAR app_type
+    VARCHAR fab_hash
   }
 
   message_ins {
@@ -178,6 +175,7 @@ erDiagram
     TIMESTAMP created_at
     VARCHAR description "nullable"
     VARCHAR federation_id
+    BOOLEAN is_agent
     TIMESTAMP updated_at
   }
 
@@ -250,8 +248,6 @@ erDiagram
     VARCHAR usage_type
   }
 
-  run ||--o| context : run_id
-  run ||--o{ logs : run_id
   run ||--o{ message_ins : run_id
   run ||--o{ message_res : run_id
   objects ||--o| object_children : parent_id
